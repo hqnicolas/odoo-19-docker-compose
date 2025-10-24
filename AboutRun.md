@@ -1,4 +1,4 @@
-What the provided `entrypoint.sh` script does, based entirely on its contents:  
+What the`entrypoint.sh` script does, based entirely on its contents:  
 
 ---
 
