@@ -1,173 +1,137 @@
-What the`entrypoint.sh` script does, based entirely on its contents:  
-
----
-
-### **File:** `entrypoint.sh`
+### **File:** `run.sh`
 
 #### **Purpose**
-This script serves as the **entrypoint** for an Odoo Docker container. It prepares the runtime environment, ensures required dependencies are installed, configures the Odoo database connection parameters dynamically, sets up log rotation, and finally starts the Odoo service.
+This script automates the setup and launch of an **Odoo 19 Docker environment** by cloning a predefined Odoo Docker Compose repository, adjusting system and file permissions, configuring ports, and starting Odoo through Docker Compose.
 
 ---
 
 ### **Step-by-Step Breakdown**
 
-#### 1. **Strict Error Handling**
+#### 1. **Argument Handling**
 ```bash
-set -e
+DESTINATION=$1
+PORT=$2
+CHAT=$3
 ```
-- The script exits immediately if any command fails, preventing the container from running in a broken state.
+- The script expects three command-line arguments:
+  1. `DESTINATION`: Directory path where the Odoo setup will be created.
+  2. `PORT`: The main Odoo web service port.
+  3. `CHAT`: The live chat service port.
 
 ---
 
-#### 2. **Database Environment Variables**
+#### 2. **Clone the Odoo Docker Repository**
 ```bash
-: ${HOST:=${DB_PORT_5432_TCP_ADDR:='db'}}
-: ${PORT:=${DB_PORT_5432_TCP_PORT:=5432}}
-: ${USER:=${DB_ENV_POSTGRES_USER:=${POSTGRES_USER:='odoo'}}}
-: ${PASSWORD:=${DB_ENV_POSTGRES_PASSWORD:=${POSTGRES_PASSWORD:='odoo19@2024'}}}
+git clone --depth=1 https://github.com/minhng92/odoo-19-docker-compose $DESTINATION
+rm -rf $DESTINATION/.git
 ```
-- These lines set the **PostgreSQL connection parameters**:
-  - `HOST`: defaults to `db`
-  - `PORT`: defaults to `5432`
-  - `USER`: defaults to `odoo`
-  - `PASSWORD`: defaults to `odoo19@2024`
-- Each variable cascades through multiple environment sources (Docker links, environment vars, or hardcoded defaults).
+- Clones the Odoo 19 Docker Compose setup into the destination directory.
+- Removes the `.git` folder to detach from version control, leaving only the necessary runtime files.
 
 ---
 
-#### 3. **Install Python Dependencies**
+#### 3. **Create the PostgreSQL Data Directory**
 ```bash
-pip3 install -r /etc/odoo/requirements.txt
+mkdir -p $DESTINATION/postgresql
 ```
-- Installs all required Python packages for Odoo as specified in the requirements file.
-- The commented-out `pip3 install pip --upgrade` line indicates that pip upgrading is optional but may cause compatibility issues.
+- Ensures that a directory exists for PostgreSQL data persistence.
 
 ---
 
-#### 4. **Install and Configure Log Rotation**
+#### 4. **Set Ownership and Secure Permissions**
 ```bash
-if ! dpkg -l | grep -q logrotate; then
-    apt-get update && apt-get install -y logrotate
+sudo chown -R $USER:$USER $DESTINATION
+sudo chmod -R 700 $DESTINATION
+```
+- Assigns ownership of all files to the current user.
+- Applies restrictive permissions (`700`) to ensure that only the user can access the setup, improving security.
+
+---
+
+#### 5. **Platform Detection (macOS vs Linux)**
+```bash
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  echo "Running on macOS. Skipping inotify configuration."
+else
+  # System configuration ...
 fi
-
-cp /etc/odoo/logrotate /etc/logrotate.d/odoo
 ```
-- Ensures that **logrotate** is installed to manage Odoo log file size and rotation.
-- Copies a predefined Odoo-specific logrotate configuration file into `/etc/logrotate.d/odoo`.
+- Detects if the script is running on macOS.
+- If so, it skips Linux-specific system configurations (`inotify` tuning).
 
 ---
 
-#### 5. **Start Cron Daemon**
+#### 6. **Linux System Configuration (inotify Watches)**
 ```bash
-cron
+if grep -qF "fs.inotify.max_user_watches" /etc/sysctl.conf; then
+  echo $(grep -F "fs.inotify.max_user_watches" /etc/sysctl.conf)
+else
+  echo "fs.inotify.max_user_watches = 524288" | sudo tee -a /etc/sysctl.conf
+fi
+sudo sysctl -p
 ```
-- Starts the cron service, which logrotate depends on for periodic execution.
+- For Linux systems, increases the maximum number of file watches (`fs.inotify.max_user_watches`) to 524,288.
+- This is essential for Odoo’s file change detection and live reloading.
+- Applies the changes immediately using `sysctl -p`.
 
 ---
 
-#### 6. **Dynamic Database Configuration**
+#### 7. **Update Docker Compose Ports**
 ```bash
-DB_ARGS=()
-
-function check_config() {
-    param="$1"
-    value="$2"
-    if grep -q -E "^\s*\b${param}\b\s*=" "$ODOO_RC" ; then       
-        value=$(grep -E "^\s*\b${param}\b\s*=" "$ODOO_RC" |cut -d " " -f3|sed 's/["\n\r]//g')
-    fi;
-    DB_ARGS+=("--${param}")
-    DB_ARGS+=("${value}")
-}
+sed -i 's/10019/'$PORT'/g' $DESTINATION/docker-compose.yml
+sed -i 's/20019/'$CHAT'/g' $DESTINATION/docker-compose.yml
 ```
-- Defines a helper function `check_config` that:
-  - Checks if a parameter (like `db_host`, `db_port`, etc.) is already defined in the Odoo config file (`$ODOO_RC`).
-  - If found, uses that value instead of the environment variable.
-  - Appends the key-value pair as Odoo command-line arguments (e.g., `--db_host db`).
-
-The script then populates `DB_ARGS`:
-```bash
-check_config "db_host" "$HOST"
-check_config "db_port" "$PORT"
-check_config "db_user" "$USER"
-check_config "db_password" "$PASSWORD"
-```
+- Updates the `docker-compose.yml` file with user-specified ports.
+- Uses `sed` to replace default port numbers (`10019` for Odoo, `20019` for chat).
+- Uses macOS-compatible syntax (`sed -i ''`) if running on macOS.
 
 ---
 
-#### 7. **Command Execution Logic**
-The script decides what to execute based on the first argument (`$1`):
-
-##### a. **Running Odoo (default case)**
+#### 8. **Adjust File and Directory Permissions**
 ```bash
-case "$1" in
-    -- | odoo)
-        shift
-        if [[ "$1" == "scaffold" ]] ; then
-            exec odoo "$@"
-        else
-            wait-for-psql.py ${DB_ARGS[@]} --timeout=30
-            exec odoo "$@" "${DB_ARGS[@]}"
-        fi
-        ;;
+find $DESTINATION -type f -exec chmod 644 {} \;
+find $DESTINATION -type d -exec chmod 755 {} \;
 ```
-- If the command is `odoo` or starts with `--`, it:
-  - Waits for PostgreSQL to become available using `wait-for-psql.py` (with a 30s timeout).
-  - Then starts Odoo with all relevant database arguments.
-
-##### b. **If Arguments Begin with `-`**
-```bash
-    -*)
-        wait-for-psql.py ${DB_ARGS[@]} --timeout=30
-        exec odoo "$@" "${DB_ARGS[@]}"
-        ;;
-```
-- Treats such commands as Odoo options (e.g., `--dev all`) and runs Odoo with them.
-
-##### c. **Other Commands**
-```bash
-    *)
-        exec "$@"
-esac
-```
-- Executes arbitrary commands (e.g., a shell or maintenance script).
+- Sets standard permissions after setup:
+  - Files: readable/writable by the owner, readable by others.
+  - Directories: executable and readable by everyone (allows navigation).
 
 ---
 
-#### 8. **Exit Code**
+#### 9. **Make Entrypoint Executable**
 ```bash
-exit 1
+chmod +x $DESTINATION/entrypoint.sh
 ```
-- If no valid execution path is matched, the script exits with a failure code.
+- Ensures that the `entrypoint.sh` script has execution permissions so Docker can use it as the container entrypoint.
 
 ---
 
-### **Key Features**
-- **Automatic dependency installation** (`pip` + `logrotate`)
-- **Dynamic Odoo configuration** via environment or config file
-- **Database readiness check** before Odoo starts
-- **Log rotation support**
-- **Safe and flexible execution logic**
-
----
-
-### **Usage**
-This script is automatically invoked when the Odoo Docker container starts (defined as the container’s `ENTRYPOINT`).  
-It expects the following environment variables to be set (optional defaults provided):
-- `HOST`
-- `PORT`
-- `USER`
-- `PASSWORD`
-
-You can also run:
+#### 10. **Start the Odoo Docker Containers**
 ```bash
-docker run -e HOST=db -e USER=odoo my-odoo-image
+if ! is_present="$(type -p "docker-compose")" || [[ -z $is_present ]]; then
+  docker compose -f $DESTINATION/docker-compose.yml up -d
+else
+  docker-compose -f $DESTINATION/docker-compose.yml up -d
+fi
 ```
+- Checks whether `docker-compose` is installed.
+- If not, falls back to using the newer `docker compose` command.
+- Starts the Odoo and PostgreSQL services in detached mode (`-d`).
 
 ---
 
-### **In Context with `run.sh` and `call.sh`**
-- `call.sh` downloads and executes `run.sh` from the Odoo Docker Compose repo.
-- `run.sh` clones the Odoo setup, prepares directories, and adjusts Docker settings.
-- Once containers are up, **`entrypoint.sh`** runs **inside the Odoo container** to handle runtime configuration and launch Odoo itself.
+#### 11. **Completion Message**
+```bash
+echo "Odoo started at http://localhost:$PORT | Master Password: minhng.info | Live chat port: $CHAT"
+```
+- Prints a summary with:
+  - The Odoo URL and port.
+  - The default master password (`minhng.info`).
+  - The live chat port.
 
 ---
+
+### **Summary**
+The `run.sh` script provides a **fully automated setup** for deploying Odoo 19 in Docker.  
+It handles everything from cloning the repository and configuring ports to securing permissions and starting the services, requiring minimal user input.
+```
